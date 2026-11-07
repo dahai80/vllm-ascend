@@ -7,6 +7,7 @@ import triton.language as tl
 from vllm_ascend.lsa.read_paged import read_pool_rows
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 # Decode-side LSA index over the paged KV pool, one instance per full-attention layer.
 # Keys live in a slot-indexed buffer (unit rows, normalize(k_pf @ W_K)); when a request's
@@ -118,13 +119,21 @@ class LayerIndex:
             return
         self.max_rows = pool_rows
         d = self.wk.shape[1]
+        # Slot-indexed key rows cover the whole KV pool; bucket rows are
+        # cluster_block/bucket_size per closed block, a small fraction.
         self.index_keys = torch.zeros(pool_rows, d, device=self.device, dtype=torch.bfloat16)
-        self.centroids = torch.zeros(pool_rows, d, device=self.device, dtype=torch.bfloat16)
-        self.members = torch.zeros(pool_rows, self.config.bucket_cap, device=self.device, dtype=torch.int32)
-        logger.info("LSA layer %d pools %d rows x %d dims", self.layer_id, pool_rows, d)
+        bucket_rows = max(pool_rows // self.config.cluster_block, 1024) * self.block_bucket_count
+        self.bucket_rows = bucket_rows
+        self.centroids = torch.zeros(bucket_rows, d, device=self.device, dtype=torch.bfloat16)
+        self.members = torch.zeros(bucket_rows, self.config.bucket_cap, device=self.device, dtype=torch.int32)
+        logger.info("LSA layer %d pools slots=%d bucket_rows=%d dims=%d", self.layer_id, pool_rows, bucket_rows, d)
 
     def append_keys(self, slots: torch.Tensor, keys: torch.Tensor):
-        self.index_keys[slots.long()] = keys
+        mask = slots >= 0
+        if bool(mask.all()):
+            self.index_keys[slots.long()] = keys
+        else:
+            self.index_keys[slots[mask].long()] = keys[mask]
 
     def ensure_blocks(self, req_id: int, seq_len: int, gather_block):
         # gather_block(block_index) -> index keys [cluster_block, D] bf16 for one closed block
@@ -137,7 +146,7 @@ class LayerIndex:
             if state.base_row < 0:
                 state.base_row = self.row_cursor
             start = self.row_cursor
-            if start + count > self.max_rows:
+            if start + count > self.bucket_rows:
                 raise RuntimeError(f"LSA layer {self.layer_id} row pool exhausted")
             self.centroids[start : start + count] = buckets.bucket_centroids
             self.members[start : start + count] = buckets.bucket_members
@@ -158,13 +167,9 @@ class LayerIndex:
     def select_decode(
         self,
         q_idx: torch.Tensor,
-        q_attn: torch.Tensor,
         req_ids: list[int],
         positions: torch.Tensor,
         slot_table: torch.Tensor,
-        key_pool: torch.Tensor,
-        value_pool: torch.Tensor,
-        scale: float,
     ) -> torch.Tensor:
         from lsa.core.kernels.triton.keys import unpack_ids
         from lsa.core.kernels.triton.top_k import top_keys
@@ -188,7 +193,7 @@ class LayerIndex:
             self.config.top_k,
             slot_table=slot_table,
         )
-        return read_pool_rows(q_attn, key_pool, value_pool, lists, scale)
+        return lists
 
 
 def build_buckets(keys: torch.Tensor, config: LsaConfig):
@@ -211,6 +216,8 @@ class LsaState:
             for layer_id in layer_ids
         }
         self.step_cache = {}
+        self.engaged = False
+        self.shape_logged = False
         logger.info("LSA armed layers=%s min_context=%d", layer_ids, config.min_context)
 
 
