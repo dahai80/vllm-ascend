@@ -47,6 +47,8 @@ def _read_pool_kernel(
         offs = start + tl.arange(0, BLOCK)
         live = offs < keep_length
         idx = tl.load(slots_ptr + row * keep_length + offs, mask=live, other=0)
+        live = live & (idx >= 0)
+        idx = tl.maximum(idx, 0)
         kt = tl.load(
             k_ptr + (idx[None, :] * KVH + g) * DIM + d[:, None],
             mask=live[None, :],

@@ -91,7 +91,9 @@ class AscendQwen3NextAttention(Qwen3NextAttention):
 
             q, k = self.rotary_emb(positions, q, k)
 
-        attn_output = self.attn(q, k, v)
+        from vllm_ascend.lsa.hook import lsa_forward_or_fallback
+
+        attn_output = lsa_forward_or_fallback(self, q, k, v)
 
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)
