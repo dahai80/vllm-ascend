@@ -58,40 +58,29 @@ def lsa_forward_or_fallback(attn_module, q: torch.Tensor, k: torch.Tensor, v: to
         return attn_module.attn(q, k, v)
 
 
-def _read_mxfp8(q_rows, lists, key_cache, value_cache, k_scale_cache, v_recip, scale):
-    # lists [B, K] absolute slots (-1 padded); PA_NZ cache
-    # key/value [num_blocks, kvh, D//32, block_size, 32] fp8,
-    # k_scale [num_blocks, kvh, block_size//16, D//64, 16, 2] e8m0 bytes.
+def _bitcast_u8(t: torch.Tensor) -> torch.Tensor:
+    # NPU view(torch.uint8) on fp8 casts values instead of reinterpreting bits;
+    # build the uint8 view over the same untyped storage instead.
+    shape = list(t.shape)
+    u8 = torch.empty(0, dtype=torch.uint8, device=t.device)
+    return u8.set_(t.untyped_storage(), 0, shape, None)
+
+
+def _read_mirror(q_rows, lists, mirror_k, mirror_v, kvh, head_dim, scale):
+    # lists [B, K] absolute slots (-1 padded); read pre-quantization bf16 rows
+    # from the per-layer shadow cache (NPU int8/fp8 indexed reads are corrupt).
     batch = q_rows.shape[0]
-    kvh = key_cache.shape[1]
-    num_groups = key_cache.shape[2]
-    block_size = key_cache.shape[3]
-    head_dim = num_groups * 32
-    slot = lists.long().clamp_min(0)
-    blk = slot // block_size
-    off = slot % block_size
-    kbytes = key_cache.view(torch.uint8)
-    kdata = (
-        kbytes[blk, :, :, off, :].contiguous().view(torch.float8_e4m3fn).to(torch.float32)
-        .view(batch, -1, kvh, num_groups, 32)
-    )
-    row = off // 16
-    frag = off % 16
-    ksc = k_scale_cache[blk, :, row, :, frag, :].to(torch.int32)
-    ksc = torch.pow(2.0, (ksc - 127).to(torch.float32)).unsqueeze(-1)
-    k_sel = (kdata.view(batch, -1, kvh, num_groups // 2, 2, 32) * ksc).view(batch, -1, kvh, head_dim).to(q_rows.dtype)
-    vdata = (
-        value_cache.view(torch.uint8)[blk, :, :, off, :].contiguous().view(torch.float8_e4m3fn).to(torch.float32)
-        .view(batch, -1, kvh, head_dim)
-    )
-    v_sel = (vdata / v_recip.to(torch.float32).view(kvh, head_dim)).to(q_rows.dtype)
-    live = (lists >= 0).to(q_rows.dtype).unsqueeze(-1).unsqueeze(-1)
-    v_sel = v_sel * live
+    slot = lists.reshape(-1).long().clamp_min(0)
+    n = slot.shape[0]
+    k_sel = mirror_k[slot].to(torch.float32).view(n, kvh, head_dim)
+    v_sel = mirror_v[slot].to(torch.float32).view(n, kvh, head_dim)
     qg = q_rows.view(batch, kvh, -1, head_dim).to(torch.float32)
-    logits = torch.einsum("bhgd,bkhd->bhgk", qg, k_sel.float()) * scale
+    k_sel = k_sel.view(batch, -1, kvh, head_dim)
+    v_sel = v_sel.view(batch, -1, kvh, head_dim)
+    logits = torch.einsum("bhgd,bkhd->bhgk", qg, k_sel) * scale
     logits = logits.masked_fill(lists[:, None, None, :] < 0, float("-inf"))
     probs = torch.softmax(logits, dim=-1)
-    out = torch.einsum("bhgk,bkhd->bhgd", probs, v_sel.float())
+    out = torch.einsum("bhgk,bkhd->bhgd", probs, v_sel)
     return out.reshape(batch, -1, head_dim).to(q_rows.dtype)
 
 
@@ -123,7 +112,7 @@ def _lsa_forward(attn_module, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor)
     # Index keys must cover prefill tokens too: decode-time bucket building
     # gathers whole cluster blocks whose rows were written at prefill.
     if metadata.attn_state.name != "DecodeOnly":
-        _append_step_keys(attn_module, layer_index, metadata, k)
+        _append_step_keys(attn_module, layer_index, metadata, k, v)
         return backend(q, k, v)
     if getattr(forward_context, "cudagraph_runtime_mode", None) is not None and str(
         forward_context.cudagraph_runtime_mode
@@ -162,6 +151,8 @@ def _lsa_forward(attn_module, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor)
         v_rows.view(batch, -1), v_recip, None, torch.float8_e4m3fn, -1, False
     ).view(batch, kv_heads, head_dim)
     backend.impl.reshape_and_cache(key_mxfp8, value_mxfp8, key_scale, kv_cache, metadata)
+    layer_index.ensure_mirror(key_cache.shape[0] * block_size, kv_heads, head_dim)
+    layer_index.write_mirror(slots, k_rows, v_rows)
 
     # 2. index keys of the new tokens, slot-indexed
     layer_index.ensure_pools(key_cache.shape[0] * block_size)
@@ -198,13 +189,13 @@ def _lsa_forward(attn_module, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor)
     lists = layer_index.select_decode(q_idx, req_keys, positions, slot_table)
     if lists is None:
         return backend(q, k, v)
-    out_rows = _read_mxfp8(q_rows, lists, key_cache, value_cache, k_scale_cache, v_recip, scale)
+    out_rows = _read_mirror(q_rows, lists, layer_index.mirror_k, layer_index.mirror_v, kv_heads, head_dim, scale)
     out = torch.zeros(num_tokens, q.shape[1], device=q.device, dtype=q.dtype)
     out[:batch] = out_rows.reshape(batch, -1)
     return out
 
 
-def _append_step_keys(attn_module, layer_index, metadata, k: torch.Tensor):
+def _append_step_keys(attn_module, layer_index, metadata, k: torch.Tensor, v: torch.Tensor):
     n = metadata.num_actual_tokens
     if n <= 0:
         return
@@ -216,8 +207,11 @@ def _append_step_keys(attn_module, layer_index, metadata, k: torch.Tensor):
     layer_index.ensure_pools(key_cache.shape[0] * block_size)
     kv_heads = attn_module.num_kv_heads
     head_dim = attn_module.head_dim
-    rotary_dim = int(getattr(attn_module.rotary_emb, "rotary_dim", 0)) or head_dim // 4
+    layer_index.ensure_mirror(key_cache.shape[0] * block_size, kv_heads, head_dim)
     k_rows = k[:n].view(n, kv_heads, head_dim)
+    v_rows = v[:n].view(n, kv_heads, head_dim)
+    layer_index.write_mirror(metadata.slot_mapping[:n], k_rows, v_rows)
+    rotary_dim = int(getattr(attn_module.rotary_emb, "rotary_dim", 0)) or head_dim // 4
     keys = make_index_key(k_rows, layer_index.wk, rotary_dim, kv_heads)
     layer_index.append_keys(metadata.slot_mapping[:n], keys)
 

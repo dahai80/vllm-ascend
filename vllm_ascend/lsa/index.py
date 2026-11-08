@@ -1,4 +1,5 @@
 import logging
+import os
 
 import torch
 import triton
@@ -113,6 +114,43 @@ class LayerIndex:
         self.members = None
         self.block_bucket_count = config.cluster_block // config.bucket_size
         self.max_rows = 0
+        self.bucket_rows = 0
+        # bf16 shadow of the original (pre-quantization) K/V rows, slot-indexed.
+        # NPU int8/fp8 indexed reads are corrupt on this stack, so the sparse
+        # read path gathers from this mirror instead of the mxfp8 caches.
+        self.mirror_k = None
+        self.mirror_v = None
+
+    def ensure_mirror(self, rows: int, kvh: int, head_dim: int):
+        d = kvh * head_dim
+        cap = int(os.environ.get("LSA_MIRROR_ROWS", "0"))
+        if cap > 0:
+            rows = min(rows, cap)
+        if self.mirror_k is None:
+            self.mirror_k = torch.zeros(rows, d, device=self.device, dtype=torch.bfloat16)
+            self.mirror_v = torch.zeros(rows, d, device=self.device, dtype=torch.bfloat16)
+            logger.info("LSA layer %d mirror rows=%d dims=%d", self.layer_id, rows, d)
+        elif rows > self.mirror_k.shape[0]:
+            grow_k = torch.zeros(rows, d, device=self.device, dtype=torch.bfloat16)
+            grow_v = torch.zeros(rows, d, device=self.device, dtype=torch.bfloat16)
+            grow_k[: self.mirror_k.shape[0]] = self.mirror_k
+            grow_v[: self.mirror_v.shape[0]] = self.mirror_v
+            self.mirror_k = grow_k
+            self.mirror_v = grow_v
+            logger.info("LSA layer %d mirror grown rows=%d", self.layer_id, rows)
+
+    def write_mirror(self, slots: torch.Tensor, k_rows: torch.Tensor, v_rows: torch.Tensor):
+        mask = slots >= 0
+        if not bool(mask.all()):
+            slots = slots[mask]
+            k_rows = k_rows[mask]
+            v_rows = v_rows[mask]
+        if slots.numel() == 0:
+            return
+        if int(slots.max()) >= self.mirror_k.shape[0]:
+            raise RuntimeError(f"LSA mirror capacity exceeded: slot {int(slots.max())} >= {self.mirror_k.shape[0]}")
+        self.mirror_k[slots.long()] = k_rows.reshape(slots.shape[0], -1).to(torch.bfloat16)
+        self.mirror_v[slots.long()] = v_rows.reshape(slots.shape[0], -1).to(torch.bfloat16)
 
     def ensure_pools(self, pool_rows: int):
         if self.index_keys is not None:
@@ -142,6 +180,11 @@ class LayerIndex:
         for block_index in range(state.closed_blocks, closed):
             keys = gather_block(block_index)
             buckets = build_buckets(keys, self.config)
+            # build_buckets numbers members from the start of its input, so
+            # one gathered block yields block-relative positions; shift them
+            # to absolute positions for the slot_table mapping.
+            members = buckets.bucket_members
+            members = torch.where(members >= 0, members + block_index * self.config.cluster_block, members)
             count = buckets.bucket_centroids.shape[0]
             if state.base_row < 0:
                 state.base_row = self.row_cursor
@@ -149,7 +192,7 @@ class LayerIndex:
             if start + count > self.bucket_rows:
                 raise RuntimeError(f"LSA layer {self.layer_id} row pool exhausted")
             self.centroids[start : start + count] = buckets.bucket_centroids
-            self.members[start : start + count] = buckets.bucket_members
+            self.members[start : start + count] = members
             self.row_cursor += count
             state.closed_blocks = block_index + 1
 
@@ -192,6 +235,7 @@ class LayerIndex:
             self.config.sink,
             self.config.top_k,
             slot_table=slot_table,
+            slot_rows=torch.arange(batch, device=slot_table.device, dtype=torch.int64),
         )
         return lists
 
