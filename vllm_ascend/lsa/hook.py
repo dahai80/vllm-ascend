@@ -36,18 +36,33 @@ def _try_arm(attn_module):
         return False
     cfg = LsaConfig(block if isinstance(block, dict) else dict(block))
     device = next(attn_module.parameters()).device
-    set_state(LsaState(cfg, layer_ids, device))
+    state = LsaState(cfg, layer_ids, device)
+    max_model_len = 40960
+    try:
+        from vllm.config import get_current_vllm_config
+
+        max_model_len = int(get_current_vllm_config().model_config.max_model_len)
+    except Exception:
+        logger.warning("LSA arm: max_model_len unavailable, defaulting %d", max_model_len)
+    for layer_index in state.layers.values():
+        layer_index.band_rows_for(max_model_len)
+    set_state(state)
     return True
 
 
 def _step_cache(md, key, builder):
-    state = get_state()
-    cache_key = (id(md), key)
-    if cache_key not in state.step_cache:
-        if len(state.step_cache) > 64:
-            state.step_cache.clear()
-        state.step_cache[cache_key] = builder()
-    return state.step_cache[cache_key]
+    # Cache lifetime tied to the metadata object itself: id(md) aliasing
+    # after GC could hand a new step a stale previous-step tensor.
+    cache = getattr(md, "_lsa_step_cache", None)
+    if cache is None:
+        cache = {}
+        try:
+            md._lsa_step_cache = cache
+        except Exception:
+            pass
+    if key not in cache:
+        cache[key] = builder()
+    return cache[key]
 
 
 def lsa_forward_or_fallback(attn_module, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
@@ -125,11 +140,6 @@ def _lsa_forward(attn_module, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor)
     if batch == 0 or metadata.seq_lens_list is None:
         return backend(q, k, v)
     seq_lens = list(metadata.seq_lens_list)[:batch]
-    if min(seq_lens) < max(cfg.min_context, cfg.cluster_block + cfg.window):
-        return backend(q, k, v)
-    if not state.engaged:
-        state.engaged = True
-        logger.info("LSA engaged: layer=%s batch=%s seq_lens=%s", layer_id, batch, seq_lens[:4])
 
     kv_heads = attn_module.num_kv_heads
     head_dim = attn_module.head_dim
@@ -142,7 +152,10 @@ def _lsa_forward(attn_module, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor)
     block_tables = metadata.block_tables[:batch]
     slots = metadata.slot_mapping[:batch]
 
-    # 1. quantize the new k/v rows and write through the backend's PA_NZ scatter
+    # 1. quantize the new k/v rows and write through the backend's PA_NZ scatter.
+    # This runs before every gate: the index and mirror must be fed on every
+    # step regardless of which attention implementation the step uses, or the
+    # shadow cache and key rows go silently stale.
     k_rows = k[:batch].view(batch, kv_heads, head_dim)
     v_rows = v[:batch].view(batch, kv_heads, head_dim)
     key_mxfp8, key_scale = torch_npu.npu_dynamic_mx_quant(k_rows, dst_type=torch.float8_e4m3fn)
@@ -160,6 +173,12 @@ def _lsa_forward(attn_module, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor)
     rotary_dim = int(getattr(attn_module.rotary_emb, "rotary_dim", 0)) or head_dim // 4
     keys = make_index_key(k_rows, wk, rotary_dim, kv_heads)
     layer_index.append_keys(slots, keys)
+
+    if min(seq_lens) < max(cfg.min_context, cfg.cluster_block + cfg.window):
+        return backend(q, k, v)
+    if not state.engaged:
+        state.engaged = True
+        logger.info("LSA engaged: layer=%s batch=%s seq_lens=%s", layer_id, batch, seq_lens[:4])
 
     # 3. per-request host state and closed-block clustering
     req_keys = _step_cache(metadata, "req_keys", lambda: _req_keys_of(block_tables, block_size, batch))

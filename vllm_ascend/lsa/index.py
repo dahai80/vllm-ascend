@@ -98,6 +98,7 @@ class ReqIndex:
     def __init__(self):
         self.base_row = -1
         self.closed_blocks = 0
+        self.max_seq = 0
 
 
 class LayerIndex:
@@ -115,6 +116,11 @@ class LayerIndex:
         self.block_bucket_count = config.cluster_block // config.bucket_size
         self.max_rows = 0
         self.bucket_rows = 0
+        # Per-request bucket rows live in contiguous bands so the scan window
+        # base..base+counts stays valid when concurrent requests interleave
+        # block closes. band_rows is set by the hook from max_model_len.
+        self.band_rows = 0
+        self.bands_assigned = 0
         # bf16 shadow of the original (pre-quantization) K/V rows, slot-indexed.
         # NPU int8/fp8 indexed reads are corrupt on this stack, so the sparse
         # read path gathers from this mirror instead of the mxfp8 caches.
@@ -140,11 +146,11 @@ class LayerIndex:
             logger.info("LSA layer %d mirror grown rows=%d", self.layer_id, rows)
 
     def write_mirror(self, slots: torch.Tensor, k_rows: torch.Tensor, v_rows: torch.Tensor):
+        # Unconditional pad filter: no host sync; empty writes are no-ops.
         mask = slots >= 0
-        if not bool(mask.all()):
-            slots = slots[mask]
-            k_rows = k_rows[mask]
-            v_rows = v_rows[mask]
+        slots = slots[mask]
+        k_rows = k_rows[mask]
+        v_rows = v_rows[mask]
         if slots.numel() == 0:
             return
         if int(slots.max()) >= self.mirror_k.shape[0]:
@@ -152,10 +158,12 @@ class LayerIndex:
         self.mirror_k[slots.long()] = k_rows.reshape(slots.shape[0], -1).to(torch.bfloat16)
         self.mirror_v[slots.long()] = v_rows.reshape(slots.shape[0], -1).to(torch.bfloat16)
 
-    def ensure_pools(self, pool_rows: int):
+    def ensure_pools(self, pool_rows: int, band_rows: int = 0):
         if self.index_keys is not None:
             return
         self.max_rows = pool_rows
+        if band_rows > 0:
+            self.band_rows = band_rows
         d = self.wk.shape[1]
         # Slot-indexed key rows cover the whole KV pool; bucket rows are
         # cluster_block/bucket_size per closed block, a small fraction.
@@ -164,19 +172,39 @@ class LayerIndex:
         self.bucket_rows = bucket_rows
         self.centroids = torch.zeros(bucket_rows, d, device=self.device, dtype=torch.bfloat16)
         self.members = torch.zeros(bucket_rows, self.config.bucket_cap, device=self.device, dtype=torch.int32)
-        logger.info("LSA layer %d pools slots=%d bucket_rows=%d dims=%d", self.layer_id, pool_rows, bucket_rows, d)
+        logger.info(
+            "LSA layer %d pools slots=%d bucket_rows=%d band_rows=%d dims=%d",
+            self.layer_id, pool_rows, bucket_rows, self.band_rows, d
+        )
 
     def append_keys(self, slots: torch.Tensor, keys: torch.Tensor):
+        # Unconditional pad filter: no host sync; empty writes are no-ops.
         mask = slots >= 0
-        if bool(mask.all()):
-            self.index_keys[slots.long()] = keys
-        else:
-            self.index_keys[slots[mask].long()] = keys[mask]
+        self.index_keys[slots[mask].long()] = keys[mask]
 
     def ensure_blocks(self, req_id: int, seq_len: int, gather_block):
         # gather_block(block_index) -> index keys [cluster_block, D] bf16 for one closed block
-        state = self.requests.setdefault(req_id, ReqIndex())
-        closed = seq_len // self.config.cluster_block
+        state = self.requests.get(req_id)
+        if state is None:
+            state = ReqIndex()
+            self.requests[req_id] = state
+        elif seq_len < state.max_seq:
+            # block-table ids are recycled across finished requests; a
+            # shrinking seq_len means this is a new request that inherited
+            # the old id, so restart its index state in place.
+            logger.info("LSA layer %d req %d state reset (seq %d < %d)", self.layer_id, req_id, seq_len, state.max_seq)
+            state.closed_blocks = 0
+            state.base_row = -1
+        state.max_seq = max(state.max_seq, seq_len)
+        closed = (seq_len - 1) // self.config.cluster_block
+        if state.base_row < 0:
+            if self.band_rows <= 0:
+                raise RuntimeError("LSA band_rows not set before clustering")
+            start = self.bands_assigned * self.band_rows
+            if start + self.band_rows > self.bucket_rows:
+                raise RuntimeError(f"LSA layer {self.layer_id} band pool exhausted ({self.bands_assigned} bands)")
+            state.base_row = start
+            self.bands_assigned += 1
         for block_index in range(state.closed_blocks, closed):
             keys = gather_block(block_index)
             buckets = build_buckets(keys, self.config)
@@ -186,14 +214,15 @@ class LayerIndex:
             members = buckets.bucket_members
             members = torch.where(members >= 0, members + block_index * self.config.cluster_block, members)
             count = buckets.bucket_centroids.shape[0]
-            if state.base_row < 0:
-                state.base_row = self.row_cursor
-            start = self.row_cursor
-            if start + count > self.bucket_rows:
-                raise RuntimeError(f"LSA layer {self.layer_id} row pool exhausted")
+            if count != self.block_bucket_count:
+                raise RuntimeError(
+                    f"LSA layer {self.layer_id} block {block_index} yielded {count} buckets, expected {self.block_bucket_count}"
+                )
+            start = state.base_row + block_index * self.block_bucket_count
+            if start + count > state.base_row + self.band_rows:
+                raise RuntimeError(f"LSA layer {self.layer_id} band overflow at block {block_index}")
             self.centroids[start : start + count] = buckets.bucket_centroids
             self.members[start : start + count] = members
-            self.row_cursor += count
             state.closed_blocks = block_index + 1
 
     def visible_counts(self, req_ids: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
@@ -207,6 +236,10 @@ class LayerIndex:
         )
         return counts, base
 
+    def band_rows_for(self, max_model_len: int):
+        # rows one request can occupy: every cluster block of its max length
+        self.band_rows = max(1, (max_model_len + self.config.cluster_block - 1) // self.config.cluster_block) * self.block_bucket_count
+
     def select_decode(
         self,
         q_idx: torch.Tensor,
@@ -219,9 +252,11 @@ class LayerIndex:
         from lsa.core.kernels.triton.expansion import expand_in_order
 
         counts, base = self.visible_counts(req_ids)
-        max_rows = int(counts.max().item()) if counts.numel() else 0
+        # Fixed scan window per band: no host sync for max counts; rows
+        # beyond a request's counts are -inf from the scan kernel's mask.
+        max_rows = self.band_rows
         batch = q_idx.shape[0]
-        if max_rows == 0:
+        if max_rows <= 0 or not bool((counts > 0).any().item()):
             return None
         scores = scan_offset(q_idx, self.centroids, base, counts, max_rows)
         packed = top_keys(scores, counts, self.config.top_p)
